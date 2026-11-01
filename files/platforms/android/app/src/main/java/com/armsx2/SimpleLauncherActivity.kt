@@ -1,0 +1,411 @@
+package com.armsx2
+
+import android.app.AlertDialog
+import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
+import android.widget.Switch
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import com.armsx2.runtime.MainActivityRuntime
+import org.json.JSONObject
+import java.io.File
+import java.util.Locale
+import java.util.concurrent.Executors
+import kotlin.math.abs
+
+/**
+ * Launcher satu-layar: Impor game -> Impor BIOS (sekali) -> Main.
+ *
+ * Tidak menyentuh core. Memakai jalur "install yang sudah disiapkan launcher" milik
+ * MainActivityRuntime.adoptPreparedSetup: kalau BIOS sudah ada di folder BIOS internal dan intent
+ * membawa path game, wizard setup dilewati dan game langsung boot.
+ *
+ * Game disalin ke <externalFilesDir>/game/game.<ext> supaya core membacanya sebagai path biasa.
+ */
+class SimpleLauncherActivity : ComponentActivity() {
+
+    private val io = Executors.newSingleThreadExecutor()
+    private val prefs by lazy { getSharedPreferences("SimpleLauncher", Context.MODE_PRIVATE) }
+
+    private lateinit var tvGame: TextView
+    private lateinit var tvBios: TextView
+    private lateinit var tvProgress: TextView
+    private lateinit var progress: ProgressBar
+    private lateinit var btnIso: Button
+    private lateinit var btnBios: Button
+    private lateinit var btnPlay: Button
+    private lateinit var btnAdvanced: Button
+    private lateinit var rowRenderer: TextView
+    private lateinit var rowRes: TextView
+    private lateinit var swFps: Switch
+    private var loadingUi = false
+
+    @Volatile private var copying = false
+
+    private val pickIso = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importIso(uri)
+    }
+    private val pickBios = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) importBios(uris)
+    }
+
+    // ---- lokasi file ----
+    private fun gameDir() = File(getExternalFilesDir(null) ?: filesDir, "game")
+    private fun gameFile(): File? = gameDir().listFiles()?.firstOrNull {
+        it.isFile && it.name.startsWith("game.") && !it.name.endsWith(".part")
+    }
+    private fun biosDir() = MainActivityRuntime.internalBiosDir(this)
+    private fun biosCount() = biosDir().listFiles()?.count { it.isFile && !it.name.startsWith(".") } ?: 0
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        buildUi()
+        refresh()
+    }
+
+    // ---- UI (dibuat lewat kode supaya tidak menambah resource baru) ----
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun label(size: Float, color: Int = Color.WHITE, bold: Boolean = false) = TextView(this).apply {
+        textSize = size
+        setTextColor(color)
+        if (bold) setTypeface(typeface, Typeface.BOLD)
+    }
+
+    private fun button(text: String, primary: Boolean) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setTextColor(if (primary) Color.BLACK else Color.WHITE)
+        textSize = if (primary) 18f else 15f
+        background = GradientDrawable().apply {
+            cornerRadius = dp(14).toFloat()
+            if (primary) setColor(ACCENT) else { setColor(Color.TRANSPARENT); setStroke(dp(1), 0x66FFFFFF) }
+        }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(if (primary) 64 else 52)).apply {
+            topMargin = dp(10)
+        }
+    }
+
+    private fun buildUi() {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(40), dp(24), dp(24))
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        col.addView(label(30f, ACCENT, bold = true).apply { text = "UN5 Player" })
+        col.addView(label(14f, 0xFFAAAAAA.toInt()).apply {
+            text = "Impor game milikmu, lalu main."
+            setPadding(0, dp(4), 0, dp(24))
+        })
+
+        tvGame = label(16f).apply { setPadding(0, dp(6), 0, dp(6)) }
+        tvBios = label(16f).apply { setPadding(0, dp(6), 0, dp(6)) }
+        col.addView(tvGame)
+        col.addView(tvBios)
+
+        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)).apply { topMargin = dp(12) }
+        }
+        tvProgress = label(13f, 0xFFAAAAAA.toInt()).apply { visibility = View.GONE }
+        col.addView(progress)
+        col.addView(tvProgress)
+
+        btnIso = button("Impor Game (.iso)", false).apply { setOnClickListener { pickIso.launch(arrayOf("*/*")) } }
+        btnBios = button("Impor BIOS (cukup sekali)", false).apply { setOnClickListener { pickBios.launch(arrayOf("*/*")) } }
+        btnPlay = button("MAIN", true).apply { setOnClickListener { play() } }
+        btnAdvanced = button("Pengaturan lanjutan", false).apply { setOnClickListener { openAdvanced() } }
+        col.addView(btnIso)
+        col.addView(btnBios)
+
+        col.addView(label(13f, 0xFFAAAAAA.toInt(), bold = true).apply {
+            text = "PENGATURAN CEPAT"
+            setPadding(0, dp(24), 0, 0)
+        })
+        rowRenderer = settingRow { pickRenderer() }
+        rowRes = settingRow { pickResolution() }
+        swFps = Switch(this).apply {
+            text = "Tampilkan panel FPS"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(0xFF1A1A1F.toInt()) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(8) }
+            setOnCheckedChangeListener { _, checked ->
+                if (!loadingUi) editGlobal { it.put("osdShowFps", checked) }
+            }
+        }
+        col.addView(rowRenderer)
+        col.addView(rowRes)
+        col.addView(swFps)
+        col.addView(label(12f, 0xFF888888.toInt()).apply {
+            text = "Saran awal kalau lag di Mali/MediaTek: OpenGL + resolusi 1x. Belum diuji di semua perangkat."
+            setPadding(0, dp(8), 0, 0)
+        })
+        col.addView(btnPlay.apply { (layoutParams as LinearLayout.LayoutParams).topMargin = dp(28) })
+        col.addView(btnAdvanced)
+
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(0xFF0E0E10.toInt())
+            isFillViewport = true
+            addView(col)
+        })
+    }
+
+    private fun refresh() {
+        val g = gameFile()
+        tvGame.text = if (g != null) {
+            "Game: " + (prefs.getString("gameName", null) ?: g.name) + "  (" + fmtSize(g.length()) + ")"
+        } else "Game: belum diimpor"
+        val n = biosCount()
+        tvBios.text = if (n > 0) "BIOS: $n file" else "BIOS: belum diimpor"
+        btnBios.text = if (n > 0) "BIOS terpasang (ketuk untuk ganti)" else "Impor BIOS (cukup sekali)"
+        val j = readGlobal()
+        val rName = RENDERERS.firstOrNull { it.second == j.optString("renderer", "auto") }?.first
+            ?: j.optString("renderer", "auto")
+        val resV = j.optDouble("upscaleFloat", 1.0)
+        val resName = RESOLUTIONS.firstOrNull { abs(it.second - resV) < 0.01 }?.first
+            ?: String.format(Locale.US, "%.2fx", resV)
+        rowRenderer.text = "Renderer: $rName   ›"
+        rowRes.text = "Resolusi: $resName   ›"
+        loadingUi = true
+        swFps.isChecked = j.optBoolean("osdShowFps", false)
+        loadingUi = false
+        btnPlay.isEnabled = !copying && g != null && n > 0
+        btnPlay.alpha = if (btnPlay.isEnabled) 1f else 0.4f
+    }
+
+    private fun setBusy(busy: Boolean) {
+        copying = busy
+        btnIso.isEnabled = !busy
+        btnBios.isEnabled = !busy
+        btnAdvanced.isEnabled = !busy
+        progress.visibility = if (busy) View.VISIBLE else View.GONE
+        tvProgress.visibility = if (busy) View.VISIBLE else View.GONE
+        if (busy) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        refresh()
+    }
+
+    // ---- impor game ----
+    private fun importIso(uri: Uri) {
+        if (copying) return
+        val name = displayName(uri)
+        val ext = name.substringAfterLast('.', "iso").lowercase(Locale.ROOT).takeIf { it in GAME_EXT } ?: "iso"
+        val size = querySize(uri)
+        val dir = gameDir().apply { mkdirs() }
+        val reclaim = gameFile()?.length() ?: 0L   // game lama akan dihapus setelah salinan baru sukses
+        if (size > 0 && dir.usableSpace + reclaim < size + 256L * 1024 * 1024) {
+            toast("Penyimpanan kurang. Butuh sekitar ${size / 1048576} MB kosong.")
+            return
+        }
+        setBusy(true)
+        progress.isIndeterminate = size <= 0
+        progress.progress = 0
+        tvProgress.text = "Menyalin game..."
+        io.execute {
+            val tmp = File(dir, "game.$ext.part")
+            var ok = false
+            try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    tmp.outputStream().use { out ->
+                        val buf = ByteArray(1 shl 20)
+                        var total = 0L
+                        var lastUi = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            total += n
+                            val now = System.currentTimeMillis()
+                            if (now - lastUi > 300) {
+                                lastUi = now
+                                val done = total
+                                runOnUiThread { showProgress(done, size) }
+                            }
+                        }
+                    }
+                    ok = tmp.length() > 0 && (size <= 0 || tmp.length() == size)
+                }
+            } catch (_: Exception) {
+                ok = false
+            }
+            if (ok) {
+                dir.listFiles()?.forEach {
+                    if (it.isFile && it.name.startsWith("game.") && !it.name.endsWith(".part")) it.delete()
+                }
+                ok = tmp.renameTo(File(dir, "game.$ext"))
+            }
+            if (!ok) tmp.delete() else prefs.edit().putString("gameName", name).apply()
+            runOnUiThread {
+                setBusy(false)
+                toast(if (ok) "Game siap dimainkan" else "Gagal menyalin game (penyimpanan penuh atau file tidak terbaca)")
+            }
+        }
+    }
+
+    private fun showProgress(done: Long, size: Long) {
+        if (size > 0) {
+            progress.progress = ((done * 1000) / size).toInt()
+            tvProgress.text = "${done / 1048576} MB / ${size / 1048576} MB"
+        } else {
+            tvProgress.text = "${done / 1048576} MB"
+        }
+    }
+
+    // ---- impor BIOS ----
+    private fun importBios(uris: List<Uri>) {
+        if (copying) return
+        setBusy(true)
+        progress.isIndeterminate = true
+        tvProgress.text = "Menyalin BIOS..."
+        io.execute {
+            val dir = biosDir().apply { mkdirs() }
+            var count = 0
+            for (u in uris) {
+                try {
+                    val size = querySize(u)
+                    if (size > MAX_BIOS_BYTES) continue          // file BIOS PS2 kecil; abaikan file besar
+                    val safe = displayName(u).replace('/', '_')
+                    contentResolver.openInputStream(u)?.use { input ->
+                        File(dir, safe).outputStream().use { input.copyTo(it) }
+                    }
+                    count++
+                } catch (_: Exception) { }
+            }
+            runOnUiThread {
+                setBusy(false)
+                toast(if (count > 0) "BIOS: $count file disalin" else "Tidak ada file BIOS yang bisa disalin")
+            }
+        }
+    }
+
+    // ---- main ----
+    private fun play() {
+        val game = gameFile()
+        when {
+            game == null -> toast("Impor game dulu")
+            biosCount() == 0 -> toast("Impor BIOS dulu")
+            else -> {
+                // Path biasa (tanpa skema), sama seperti hasil scan library; Main yang akan
+                // melewati wizard karena BIOS sudah ada di folder BIOS internal.
+                startActivity(Intent(this, Main::class.java).apply {
+                    action = Intent.ACTION_VIEW
+                    data = Uri.parse(game.absolutePath)
+                })
+                finish()
+            }
+        }
+    }
+
+    /** Menu ARMSX2 lengkap: renderer, resolusi, FPS/OSD, kontrol, driver GPU, dan seterusnya. */
+    private fun openAdvanced() {
+        startActivity(Intent(this, Main::class.java))
+        finish()
+    }
+
+    // ---- pengaturan cepat ----
+    // Ditulis ke SharedPreferences "ARMSX2" kunci "config.global" (JSON datar milik ConfigStore).
+    // Kunci yang tidak ada otomatis memakai default ARMSX2, jadi cukup tiga kunci ini.
+    private val emuPrefs by lazy { getSharedPreferences("ARMSX2", Context.MODE_PRIVATE) }
+
+    private fun readGlobal(): JSONObject = try {
+        JSONObject(emuPrefs.getString("config.global", null) ?: "{}")
+    } catch (_: Exception) {
+        JSONObject()
+    }
+
+    private fun editGlobal(change: (JSONObject) -> Unit) {
+        val j = readGlobal()
+        change(j)
+        emuPrefs.edit().putString("config.global", j.toString()).apply()
+    }
+
+    private fun settingRow(onClick: () -> Unit) = TextView(this).apply {
+        textSize = 15f
+        setTextColor(Color.WHITE)
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(0xFF1A1A1F.toInt()) }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(8) }
+        setOnClickListener { onClick() }
+    }
+
+    private fun choose(title: String, names: List<String>, current: Int, onPick: (Int) -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(names.toTypedArray(), current) { d, i -> onPick(i); d.dismiss() }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun pickRenderer() {
+        val cur = RENDERERS.indexOfFirst { it.second == readGlobal().optString("renderer", "auto") }
+        choose("Renderer", RENDERERS.map { it.first }, cur) { i ->
+            editGlobal { it.put("renderer", RENDERERS[i].second) }
+            refresh()
+        }
+    }
+
+    private fun pickResolution() {
+        val v = readGlobal().optDouble("upscaleFloat", 1.0)
+        val cur = RESOLUTIONS.indexOfFirst { abs(it.second - v) < 0.01 }
+        choose("Resolusi internal", RESOLUTIONS.map { it.first }, cur) { i ->
+            editGlobal { it.put("upscaleFloat", RESOLUTIONS[i].second) }
+            refresh()
+        }
+    }
+
+    // ---- util ----
+    private fun displayName(uri: Uri): String =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+
+    private fun querySize(uri: Uri): Long =
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+        } ?: -1L
+
+    private fun fmtSize(bytes: Long): String = when {
+        bytes >= 1L shl 30 -> String.format(Locale.US, "%.1f GB", bytes / 1073741824.0)
+        else -> "${bytes / 1048576} MB"
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    companion object {
+        private const val ACCENT = 0xFFFF8A3D.toInt()
+        private const val MAX_BIOS_BYTES = 16L * 1024 * 1024
+        private val RENDERERS = listOf(
+            "Otomatis (disarankan)" to "auto",
+            "OpenGL" to "opengl",
+            "Vulkan" to "vulkan",
+        )
+        private val RESOLUTIONS = listOf(
+            "1x - native (paling ringan)" to 1.0,
+            "1.5x" to 1.5,
+            "2x" to 2.0,
+            "3x (berat)" to 3.0,
+        )
+        private val GAME_EXT = setOf("iso", "bin", "chd", "cso", "zso", "img", "mdf")
+    }
+}
